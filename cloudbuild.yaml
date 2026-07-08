@@ -1,0 +1,11 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '--build-arg'
+      - 'VITE_API_BASE_URL=https://flowvero-backend-951243407154.us-central1.run.app/api'
+      - '-t'
+      - 'gcr.io/flowveron8n/flowvero-dashboard'
+      - '.'
+images:
+  - 'gcr.io/flowveron8n/flowvero-dashboard'
