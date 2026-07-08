@@ -8,8 +8,8 @@
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { saveLeadsToSupabase } from './_lib/supabase';
-import { appendLeadsToSheet } from './_lib/sheets';
+import { saveLeadsToSupabase } from './_lib/supabase.js';
+import { appendLeadsToSheet } from './_lib/sheets.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 

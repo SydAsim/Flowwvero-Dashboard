@@ -5,7 +5,7 @@
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { updateLeadScripts } from './_lib/supabase';
+import { updateLeadScripts } from './_lib/supabase.js';
 
 function buildScriptPrompt(businessName: string, category: string, address: string, product: string) {
   return `You are an elite B2B cold calling expert with 15+ years of experience in sales training.
