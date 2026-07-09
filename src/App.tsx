@@ -114,9 +114,9 @@ export default function App() {
     
     setIsScraping(false);
     if (result.success) {
-      showToast(`Success! Fetched ${result.fetchedCount} leads.`, 'success');
+      showToast(`Success! Fetched ${result.fetchedCount} leads, ${result.dbSaved ?? 0} new saved, ${result.dbSkipped ?? 0} duplicates skipped.`, 'success');
       setScrapeResult({ fetched: result.fetchedCount, saved: result.savedCount, dbSaved: result.dbSaved, dbSkipped: result.dbSkipped });
-      loadData(true); // reload dashboard leads
+      await loadData(true); // await reload so new leads are ready before switching tabs
       setActiveTab('Dashboard'); // switch to dashboard automatically
     } else {
       showToast(`Error: ${result.message}`, 'error');
