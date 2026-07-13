@@ -5,6 +5,11 @@
  *  2. Transforms results into lead objects
  *  3. Saves to Supabase (always)
  *  4. Optionally saves to Google Sheets (if sheetId provided)
+ *
+ * Strategy: if the original query doesn't yield enough NEW leads
+ * (because the DB already has most results), automatically tries
+ * geographic variants (north/south/east/west/downtown/etc.) to find
+ * fresh businesses in different parts of the same city.
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
@@ -68,7 +73,58 @@ function transformPlace(place: any, searchQuery: string) {
   };
 }
 
-async function searchPlaces(query: string, maxResults: number, knownUrls: Set<string> = new Set()) {
+/**
+ * Build geographic variants of a query so we can find more leads
+ * when the original query pool is exhausted in the DB.
+ *
+ * "dental clinics in orlando Florida" →
+ *   "dental clinics in north orlando Florida"
+ *   "dental clinics in south orlando Florida"
+ *   "dental clinics in downtown orlando Florida"
+ *   ... etc
+ */
+function buildQueryVariants(originalQuery: string): string[] {
+  const variants: string[] = [originalQuery];
+
+  const areaModifiers = [
+    'north', 'south', 'east', 'west', 'downtown', 'central',
+    'northeast', 'northwest', 'southeast', 'southwest',
+    'uptown', 'metro', 'suburbs', 'greater',
+  ];
+
+  // Detect "X in [location]" pattern
+  const inMatch = originalQuery.match(/^(.+?)\s+in\s+(.+)$/i);
+  if (inMatch) {
+    const [, businessType, location] = inMatch;
+    for (const mod of areaModifiers) {
+      variants.push(`${businessType} in ${mod} ${location}`);
+    }
+    // Also try "near [location]"
+    variants.push(`${businessType} near ${location}`);
+  } else {
+    // Fallback: append modifiers
+    for (const mod of areaModifiers) {
+      variants.push(`${originalQuery} ${mod}`);
+    }
+  }
+
+  return variants;
+}
+
+/**
+ * Call Google Places API for a single query.
+ * Filters out places already in DB (knownUrls) and already collected
+ * this session (collectedUrls) to ensure every result is truly new.
+ *
+ * NOTE: knownUrls is NEVER mutated here.
+ * collectedUrls IS mutated — it tracks places found across all variant calls.
+ */
+async function searchPlaces(
+  query: string,
+  maxResults: number,
+  knownUrls: Set<string>,       // from DB — read-only
+  collectedUrls: Set<string>,   // cross-variant tracker — mutated here
+): Promise<any[]> {
   const apiKey = process.env.GOOGLE_PLACES_API_KEY;
   if (!apiKey) throw new Error('GOOGLE_PLACES_API_KEY is not configured.');
 
@@ -80,20 +136,16 @@ async function searchPlaces(query: string, maxResults: number, knownUrls: Set<st
     'places.websiteUri', 'places.regularOpeningHours', 'places.location', 'nextPageToken',
   ].join(',');
 
-  console.log(`[Places] Searching for: "${query}" (need ${maxResults} NEW results, ${knownUrls.size} already in DB)`);
+  console.log(`[Places] Query: "${query}" | need ${maxResults} new | DB has ${knownUrls.size}, session has ${collectedUrls.size}`);
 
   let newPlaces: any[] = [];
   let allFetched = 0;
   let pageToken: string | undefined = undefined;
-  const API_FETCH_LIMIT = 60;
-  // Separate set to avoid intra-batch dupes WITHOUT mutating the caller's knownUrls
-  const seenInBatch = new Set<string>();
+  const API_FETCH_LIMIT = 60; // Max the Places API returns via pagination
+  const seenInPage = new Set<string>(); // within this single call only
 
   while (newPlaces.length < maxResults && allFetched < API_FETCH_LIMIT) {
-    const bodyPayload: any = {
-      textQuery: query,
-      pageSize: 20,
-    };
+    const bodyPayload: any = { textQuery: query, pageSize: 20 };
     if (pageToken) bodyPayload.pageToken = pageToken;
 
     const response = await fetch(endpoint, {
@@ -117,20 +169,23 @@ async function searchPlaces(query: string, maxResults: number, knownUrls: Set<st
 
     for (const place of places) {
       const mapsUrl: string = place.googleMapsUri || '';
-      // Skip if already in DB or already collected in this batch
-      if (mapsUrl && (knownUrls.has(mapsUrl) || seenInBatch.has(mapsUrl))) continue;
+      // Skip if: already in DB, already found this session, or duplicate within this call
+      if (mapsUrl && (knownUrls.has(mapsUrl) || collectedUrls.has(mapsUrl) || seenInPage.has(mapsUrl))) continue;
       newPlaces.push(place);
-      if (mapsUrl) seenInBatch.add(mapsUrl); // track within batch only
+      if (mapsUrl) {
+        seenInPage.add(mapsUrl);       // within-call dedup
+        collectedUrls.add(mapsUrl);   // cross-variant session dedup
+      }
     }
 
-    console.log(`[Places] Page: ${places.length} from API | ${newPlaces.length}/${maxResults} new so far | ${allFetched} total`);
+    console.log(`[Places] Page: ${places.length} from API | ${newPlaces.length}/${maxResults} new | ${allFetched} total`);
 
     pageToken = data.nextPageToken || undefined;
     if (!pageToken || places.length === 0) break;
   }
 
   const result = newPlaces.slice(0, maxResults);
-  console.log(`[Places] ✅ Returning ${result.length} NEW places (fetched ${allFetched} from API).`);
+  console.log(`[Places] ✅ "${query}" → ${result.length} new places (${allFetched} fetched from API)`);
   return result;
 }
 
@@ -155,21 +210,45 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const cleanSheetId = sheetId ? sheetId.trim() : '';
 
   try {
-    // Pre-fetch known place URLs to avoid returning already-saved results
-    console.log('[API /fetch-leads] Pre-fetching known place URLs from DB…');
+    // ── 1. Load all existing place URLs from DB (one query, used for all variants) ──
+    console.log('[API /fetch-leads] Loading existing place URLs from DB…');
     const knownUrls = await getExistingGoogleMapsUrls();
 
-    // Fetch from Google Places API — only return places NOT already in DB
-    const rawPlaces = await searchPlaces(cleanQuery, maxResults, knownUrls);
+    // ── 2. Build query variants (original first, then geographic expansions) ──
+    const variants = buildQueryVariants(cleanQuery);
+    const collectedUrls = new Set<string>(); // tracks places found this session across all variants
+    let allRawPlaces: any[] = [];
+    let variantsUsed = 0;
 
-    if (rawPlaces.length === 0) {
+    for (const variant of variants) {
+      if (allRawPlaces.length >= maxResults) break;
+
+      const needed = maxResults - allRawPlaces.length;
+      console.log(`[API] Trying variant ${variantsUsed + 1}/${variants.length}: "${variant}" | need ${needed} more`);
+
+      const places = await searchPlaces(variant, needed, knownUrls, collectedUrls);
+      allRawPlaces = allRawPlaces.concat(places);
+      variantsUsed++;
+
+      console.log(`[API] Variant yielded ${places.length} new places. Running total: ${allRawPlaces.length}/${maxResults}`);
+
+      // Small delay between variant calls to be respectful to the API
+      if (places.length === 0 && allRawPlaces.length < maxResults && variantsUsed < variants.length) {
+        await new Promise(r => setTimeout(r, 200));
+      }
+    }
+
+    // ── 3. If still nothing after all variants ──
+    if (allRawPlaces.length === 0) {
       return res.status(200).json({
         success: true, query: cleanQuery, fetchedCount: 0, savedCount: 0, leads: [],
-        message: 'No NEW results found — all matching places are already in your database. Try a different search term or location.',
+        message: `No NEW leads found — your database already has all matching businesses for "${cleanQuery}" and its geographic variations. Try a completely different city or business type.`,
       });
     }
 
-    const leads = rawPlaces.map(place => transformPlace(place, cleanQuery));
+    // ── 4. Transform & save ──
+    const leads = allRawPlaces.map(place => transformPlace(place, cleanQuery));
+    console.log(`[API] Transformed ${leads.length} new leads from ${variantsUsed} query variant(s).`);
 
     // Save to Google Sheets (optional)
     let savedCount = leads.length;
@@ -177,9 +256,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       savedCount = await appendLeadsToSheet(cleanSheetId, leads);
     }
 
-    // Save to Supabase (always)
-    // Note: do NOT pass knownUrls here — it was used only to filter API results.
-    // saveLeadsToSupabase does its own fresh DB check so it never skips genuinely new leads.
+    // Save to Supabase — fresh DB check (don't pass collectedUrls, we need a real insert check)
     const { saved: dbSaved, skipped: dbSkipped } = await saveLeadsToSupabase(leads);
     if (!cleanSheetId) savedCount = dbSaved;
 
@@ -191,7 +268,7 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       dbSaved,
       dbSkipped,
       leads,
-      message: 'Leads successfully fetched and processed.',
+      message: `Successfully fetched ${dbSaved} new leads${variantsUsed > 1 ? ` (searched ${variantsUsed} area variants to find them)` : ''}.`,
     });
 
   } catch (err: any) {
