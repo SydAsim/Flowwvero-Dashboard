@@ -8,7 +8,7 @@
  */
 
 import type { VercelRequest, VercelResponse } from '@vercel/node';
-import { saveLeadsToSupabase } from './_lib/supabase.js';
+import { saveLeadsToSupabase, getExistingGoogleMapsUrls } from './_lib/supabase.js';
 import { appendLeadsToSheet } from './_lib/sheets.js';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -68,7 +68,7 @@ function transformPlace(place: any, searchQuery: string) {
   };
 }
 
-async function searchPlaces(query: string, maxResults: number) {
+async function searchPlaces(query: string, maxResults: number, knownUrls: Set<string> = new Set()) {
   const apiKey = process.env.GOOGLE_PLACES_API_KEY;
   if (!apiKey) throw new Error('GOOGLE_PLACES_API_KEY is not configured.');
 
@@ -80,11 +80,15 @@ async function searchPlaces(query: string, maxResults: number) {
     'places.websiteUri', 'places.regularOpeningHours', 'places.location', 'nextPageToken',
   ].join(',');
 
-  let allPlaces: any[] = [];
-  let pageToken = '';
+  console.log(`[Places] Searching for: "${query}" (need ${maxResults} NEW results, ${knownUrls.size} already in DB)`);
 
-  while (allPlaces.length < maxResults) {
-    const pageSize = Math.min(maxResults - allPlaces.length, 20);
+  let newPlaces: any[] = [];
+  let allFetched = 0;
+  let pageToken = '';
+  const API_FETCH_LIMIT = 60; // Max the Places API allows via pagination
+
+  while (newPlaces.length < maxResults && allFetched < API_FETCH_LIMIT) {
+    const pageSize = Math.min(20, API_FETCH_LIMIT - allFetched);
     const bodyPayload: any = { textQuery: query, pageSize };
     if (pageToken) bodyPayload.pageToken = pageToken;
 
@@ -105,12 +109,26 @@ async function searchPlaces(query: string, maxResults: number) {
 
     const data = await response.json();
     const places = data.places || [];
-    allPlaces = allPlaces.concat(places);
+    allFetched += places.length;
+
+    // Only keep places not already in the DB
+    for (const place of places) {
+      const mapsUrl = place.googleMapsUri || '';
+      if (!mapsUrl || !knownUrls.has(mapsUrl)) {
+        newPlaces.push(place);
+        if (mapsUrl) knownUrls.add(mapsUrl); // track within batch too
+      }
+    }
+
+    console.log(`[Places] Page: ${places.length} fetched | New so far: ${newPlaces.length}/${maxResults} | Total API: ${allFetched}`);
+
     pageToken = data.nextPageToken;
     if (!pageToken || places.length === 0) break;
   }
 
-  return allPlaces.slice(0, maxResults);
+  const result = newPlaces.slice(0, maxResults);
+  console.log(`[Places] ✅ Found ${result.length} NEW results out of ${allFetched} total fetched.`);
+  return result;
 }
 
 // ── Handler ───────────────────────────────────────────────────────────────────
@@ -134,12 +152,17 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
   const cleanSheetId = sheetId ? sheetId.trim() : '';
 
   try {
-    const rawPlaces = await searchPlaces(cleanQuery, maxResults);
+    // Pre-fetch known place URLs to avoid returning already-saved results
+    console.log('[API /fetch-leads] Pre-fetching known place URLs from DB…');
+    const knownUrls = await getExistingGoogleMapsUrls();
+
+    // Fetch from Google Places API — only return places NOT already in DB
+    const rawPlaces = await searchPlaces(cleanQuery, maxResults, knownUrls);
 
     if (rawPlaces.length === 0) {
       return res.status(200).json({
         success: true, query: cleanQuery, fetchedCount: 0, savedCount: 0, leads: [],
-        message: 'No results found for this query.',
+        message: 'No NEW results found — all matching places are already in your database. Try a different search term or location.',
       });
     }
 

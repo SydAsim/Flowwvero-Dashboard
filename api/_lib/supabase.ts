@@ -17,20 +17,48 @@ export const supabase = supabaseUrl && supabaseKey
   ? createClient(supabaseUrl, supabaseKey)
   : null;
 
-// ── Save leads to Supabase, skipping duplicates ──
-export async function saveLeadsToSupabase(leads: any[]) {
+// ── Get all existing Google Maps URLs for dedup pre-filtering ──
+export async function getExistingGoogleMapsUrls(): Promise<Set<string>> {
+  if (!supabase) return new Set();
+
+  let allUrls: string[] = [];
+  let from = 0;
+  const batchSize = 1000;
+
+  while (true) {
+    const { data, error } = await supabase
+      .from('leads')
+      .select('google_maps_url')
+      .not('google_maps_url', 'is', null)
+      .neq('google_maps_url', '')
+      .range(from, from + batchSize - 1);
+
+    if (error) { console.error('[Supabase] ❌ Error fetching existing URLs:', error.message); break; }
+    if (!data || data.length === 0) break;
+
+    allUrls = allUrls.concat(data.map((r: any) => r.google_maps_url));
+    if (data.length < batchSize) break;
+    from += batchSize;
+  }
+
+  console.log(`[Supabase] 📋 Found ${allUrls.length} existing leads in DB for dedup check.`);
+  return new Set(allUrls);
+}
+
+// ── Save leads to Supabase, skipping duplicates based on google_maps_url ──
+export async function saveLeadsToSupabase(leads: any[], existingUrls?: Set<string>) {
   if (!supabase) return { saved: 0, skipped: 0 };
+
+  // If caller didn't pass known URLs, fetch them now
+  const knownUrls = existingUrls ?? await getExistingGoogleMapsUrls();
+
   let saved = 0, skipped = 0;
 
   for (const lead of leads) {
-    const { data: existing } = await supabase
-      .from('leads')
-      .select('id')
-      .eq('business_name', lead.businessName || '')
-      .eq('address', lead.address || '')
-      .maybeSingle();
+    const mapsUrl = lead.googleMapsUrl || '';
 
-    if (existing) { skipped++; continue; }
+    // Skip if this place is already in the DB (matched by unique Google Maps URL)
+    if (mapsUrl && knownUrls.has(mapsUrl)) { skipped++; continue; }
 
     const { error } = await supabase.from('leads').insert({
       business_name:   lead.businessName   || '',
@@ -38,7 +66,7 @@ export async function saveLeadsToSupabase(leads: any[]) {
       address:         lead.address         || '',
       phone:           lead.phone           || '',
       website:         lead.website         || '',
-      google_maps_url: lead.googleMapsUrl   || '',
+      google_maps_url: mapsUrl,
       rating:          lead.rating          ?? null,
       review_count:    lead.reviewCount     ?? null,
       business_status: lead.businessStatus  || '',
@@ -57,7 +85,11 @@ export async function saveLeadsToSupabase(leads: any[]) {
     });
 
     if (error) console.error(`[Supabase] ❌ Insert error for "${lead.businessName}":`, error.message);
-    else saved++;
+    else {
+      saved++;
+      // Track so intra-batch duplicates are also caught
+      if (mapsUrl) knownUrls.add(mapsUrl);
+    }
   }
 
   return { saved, skipped };
