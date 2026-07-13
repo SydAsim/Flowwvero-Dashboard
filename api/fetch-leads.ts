@@ -84,12 +84,14 @@ async function searchPlaces(query: string, maxResults: number, knownUrls: Set<st
 
   let newPlaces: any[] = [];
   let allFetched = 0;
-  let pageToken = '';
-  const API_FETCH_LIMIT = 60; // Max the Places API allows via pagination
+  let pageToken: string | undefined = undefined;
+  const API_FETCH_LIMIT = 60; // Hard cap: Places API allows max ~60 results via pagination
 
   while (newPlaces.length < maxResults && allFetched < API_FETCH_LIMIT) {
-    const pageSize = Math.min(20, API_FETCH_LIMIT - allFetched);
-    const bodyPayload: any = { textQuery: query, pageSize };
+    const bodyPayload: any = {
+      textQuery: query,
+      pageSize: 20,  // Always fetch max per page to get as many candidates as possible
+    };
     if (pageToken) bodyPayload.pageToken = pageToken;
 
     const response = await fetch(endpoint, {
@@ -108,26 +110,27 @@ async function searchPlaces(query: string, maxResults: number, knownUrls: Set<st
     }
 
     const data = await response.json();
-    const places = data.places || [];
+    const places: any[] = data.places || [];
     allFetched += places.length;
 
-    // Only keep places not already in the DB
+    // Filter: only keep places not already in the DB
     for (const place of places) {
-      const mapsUrl = place.googleMapsUri || '';
+      const mapsUrl: string = place.googleMapsUri || '';
       if (!mapsUrl || !knownUrls.has(mapsUrl)) {
         newPlaces.push(place);
-        if (mapsUrl) knownUrls.add(mapsUrl); // track within batch too
+        if (mapsUrl) knownUrls.add(mapsUrl); // prevent intra-batch dupes
       }
     }
 
-    console.log(`[Places] Page: ${places.length} fetched | New so far: ${newPlaces.length}/${maxResults} | Total API: ${allFetched}`);
+    console.log(`[Places] Page done: ${places.length} from API | ${newPlaces.length}/${maxResults} new collected | ${allFetched} total fetched`);
 
-    pageToken = data.nextPageToken;
+    // Stop if no more pages or API returned nothing
+    pageToken = data.nextPageToken || undefined;
     if (!pageToken || places.length === 0) break;
   }
 
   const result = newPlaces.slice(0, maxResults);
-  console.log(`[Places] ✅ Found ${result.length} NEW results out of ${allFetched} total fetched.`);
+  console.log(`[Places] ✅ Returning ${result.length} NEW places (fetched ${allFetched} total from API).`);
   return result;
 }
 
@@ -174,8 +177,8 @@ export default async function handler(req: VercelRequest, res: VercelResponse) {
       savedCount = await appendLeadsToSheet(cleanSheetId, leads);
     }
 
-    // Save to Supabase (always)
-    const { saved: dbSaved, skipped: dbSkipped } = await saveLeadsToSupabase(leads);
+    // Save to Supabase (always) — pass knownUrls so it skips a redundant DB fetch
+    const { saved: dbSaved, skipped: dbSkipped } = await saveLeadsToSupabase(leads, knownUrls);
     if (!cleanSheetId) savedCount = dbSaved;
 
     return res.status(200).json({
